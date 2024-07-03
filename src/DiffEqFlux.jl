@@ -14,7 +14,7 @@ using PrecompileTools: @recompile_invalidations
     using LinearAlgebra: LinearAlgebra, Diagonal, det, tr, mul!
     using Lux: Lux, Chain, Dense, StatefulLuxLayer, FromFluxAdaptor, ⊠
     using LuxCore: LuxCore, AbstractExplicitLayer, AbstractExplicitContainerLayer
-    using Random: Random, AbstractRNG, randn!
+    using Random: Random, AbstractRNG, randn!, rand!
     using Reexport: @reexport
     using SciMLBase: SciMLBase, DAEProblem, DDEFunction, DDEProblem, EnsembleProblem,
                      ODEFunction, ODEProblem, ODESolution, SDEFunction, SDEProblem, remake,

@@ -71,19 +71,20 @@ function FFJORD(
 end
 
 @inline function __trace_batched(x::AbstractArray{T, 3}) where {T}
-    return mapreduce(tr, vcat, eachslice(x; dims = 3); init = similar(x, 0))
+    # return mapreduce(tr, vcat, eachslice(x; dims = 3); init = similar(x, 0))
+    return tr.(eachslice(x; dims = 3))
 end
 
 @inline __norm_batched(x) = sqrt.(sum(abs2, x; dims = 1:(ndims(x) - 1)))
 
 function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = nothing,
-        regularize::Bool = false, monte_carlo::Bool = true) where {T, N}
+        regularize::Bool = false, monte_carlo::Bool = true, mcdist=:rademacher) where {T, N}
     L = size(u, N - 1)
     z = selectdim(u, N - 1, 1:(L - ifelse(regularize, 3, 1)))
     model = @set(_model.ps=p)
     mz = model(z, p)
     @assert size(mz) == size(z)
-    if monte_carlo
+    if !monte_carlo
         ad = ad === nothing ? AutoZygote() : ad
         e = CRC.@ignore_derivatives randn!(similar(mz))
         if ad isa AutoForwardDiff
@@ -108,7 +109,13 @@ function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = noth
         if ad isa AutoForwardDiff || ad isa AutoZygote
             J = Lux.batched_jacobian(model, ad, z)
             trace_jac = reshape(__trace_batched(J), ntuple(i -> 1, N - 1)..., :)
-            e = CRC.@ignore_derivatives randn!(similar(mz))
+            if mcdist === :rademacher
+                e = CRC.@ignore_derivatives rand!(similar(mz), [one(T), -one(T)])
+            elseif mcdist === :normal
+                e = CRC.@ignore_derivatives randn!(similar(mz))
+            else
+                error("`mcdist` must be `:rademacher` or `:normal`.")
+            end
             eJ = reshape(reshape(e, 1, :, size(e, N)) ⊠ J, size(z))
         else
             error("`ad` must be `nothing` or `AutoForwardDiff` or `AutoZygote`.")
@@ -159,8 +166,47 @@ function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N
         logpz = logpdf(n.basedist, z)
     end
     logpx = reshape(logpz, 1, S[N]) .- delta_logp
-    return (logpx, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
+    return (; logpx, delta_logp, z, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
 end
+
+# function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N}
+#     S = size(x)
+#     (; regularize, monte_carlo) = st
+#     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
+
+#     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
+
+#     ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
+
+#     _z = ChainRulesCore.@ignore_derivatives fill!(
+#         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
+
+#     prob = ODEProblem{false}(ffjord, cat(x, _z; dims = Val(N - 1)), n.tspan, ps)
+#     sol = solve(prob, n.args...; sensealg, n.kwargs...,
+#         save_everystep = false, save_start = false, save_end = true)
+#     pred = __get_pred(sol)
+#     L = size(pred, N - 1)
+
+#     z = selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
+
+#     i₁ = L - ifelse(regularize, 2, 0)
+#     delta_logp = selectdim(pred, N - 1, i₁:i₁)
+#     if regularize
+#         λ₁ = selectdim(pred, N, (L - 1):(L - 1))
+#         λ₂ = selectdim(pred, N, L:L)
+#     else # For Type Stability
+#         λ₁ = λ₂ = delta_logp
+#     end
+
+#     if n.basedist === nothing
+#         logpz = -sum(abs2, z; dims = 1:(N - 1)) / T(2) .-
+#                 T(prod(S[1:(N - 1)]) / 2 * log(2π))
+#     else
+#         logpz = logpdf(n.basedist, z)
+#     end
+#     logpx = reshape(logpz, 1, S[N]) .- delta_logp
+#     return (logpx, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
+# end
 
 __get_pred(sol::ODESolution) = last(sol.u)
 __get_pred(sol::AbstractArray{T, N}) where {T, N} = selectdim(sol, N, size(sol, N))
@@ -175,6 +221,10 @@ function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) w
         x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
     end
 
+    return __backward_ffjord(n, x, ps, st)
+end
+
+function __backward_ffjord(n::FFJORD, x, ps, st)
     N, S, T = ndims(x), size(x), eltype(x)
     (; regularize, monte_carlo) = st
     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
@@ -185,7 +235,6 @@ function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) w
 
     _z = ChainRulesCore.@ignore_derivatives fill!(
         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
-
     prob = ODEProblem{false}(ffjord, cat(x, _z; dims = Val(N - 1)), reverse(n.tspan), ps)
     sol = solve(prob, n.args...; sensealg, n.kwargs...,
         save_everystep = false, save_start = false, save_end = true)
@@ -194,6 +243,35 @@ function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) w
 
     return selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
 end
+
+# function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
+#     px = n.basedist
+
+#     if px === nothing
+#         x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
+#             randn(rng, T1, (n.input_dims..., n_samples))
+#     else
+#         x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
+#     end
+
+#     N, S, T = ndims(x), size(x), eltype(x)
+#     (; regularize, monte_carlo) = st
+#     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
+
+#     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
+
+#     ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
+
+#     _z = ChainRulesCore.@ignore_derivatives fill!(
+#         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
+#     prob = ODEProblem{false}(ffjord, cat(x, _z; dims = Val(N - 1)), reverse(n.tspan), ps)
+#     sol = solve(prob, n.args...; sensealg, n.kwargs...,
+#         save_everystep = false, save_start = false, save_end = true)
+#     pred = __get_pred(sol)
+#     L = size(pred, N - 1)
+
+#     return selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
+# end
 
 """
 FFJORD can be used as a distribution to generate new samples by `rand` or estimate densities
