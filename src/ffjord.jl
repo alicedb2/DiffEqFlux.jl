@@ -61,7 +61,7 @@ end
 
 function LuxCore.initialstates(rng::AbstractRNG, n::FFJORD)
     return (; model = LuxCore.initialstates(rng, n.model),
-        regularize = false, monte_carlo = true)
+        regularize = false, monte_carlo = false)
 end
 
 function FFJORD(
@@ -78,13 +78,13 @@ end
 @inline __norm_batched(x) = sqrt.(sum(abs2, x; dims = 1:(ndims(x) - 1)))
 
 function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = nothing,
-        regularize::Bool = false, monte_carlo::Bool = true, mcdist=:rademacher) where {T, N}
+        regularize::Bool = false, monte_carlo::Bool = false, mcdist=:rademacher) where {T, N}
     L = size(u, N - 1)
     z = selectdim(u, N - 1, 1:(L - ifelse(regularize, 3, 1)))
     model = @set(_model.ps=p)
     mz = model(z, p)
     @assert size(mz) == size(z)
-    if !monte_carlo
+    if monte_carlo
         ad = ad === nothing ? AutoZygote() : ad
         e = CRC.@ignore_derivatives randn!(similar(mz))
         if ad isa AutoForwardDiff
