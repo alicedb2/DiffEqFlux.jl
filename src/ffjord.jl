@@ -48,10 +48,9 @@ Information Processing Systems, pp. 6572-6583. 2018.
 "Ffjord: Free-form continuous dynamics for scalable reversible generative models." arXiv
 preprint arXiv:1810.01367 (2018).
 """
-@concrete struct FFJORD{M <: AbstractExplicitLayer, D <: Union{Nothing, Distribution}} <:
+@concrete struct FFJORD{M <: AbstractExplicitLayer} <:
                  CNFLayer
     model::M
-    basedist::D
     ad
     input_dims
     tspan
@@ -65,9 +64,9 @@ function LuxCore.initialstates(rng::AbstractRNG, n::FFJORD)
 end
 
 function FFJORD(
-        model, tspan, input_dims, args...; ad = nothing, basedist = nothing, kwargs...)
+        model, tspan, input_dims, args...; ad = nothing, kwargs...)
     !(model isa AbstractExplicitLayer) && (model = FromFluxAdaptor()(model))
-    return FFJORD(model, basedist, ad, input_dims, tspan, args, kwargs)
+    return FFJORD(model, ad, input_dims, tspan, args, kwargs)
 end
 
 @inline function __trace_batched(x::AbstractArray{T, 3}) where {T}
@@ -159,70 +158,24 @@ function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N
         λ₁ = λ₂ = delta_logp
     end
 
-    if n.basedist === nothing
-        logpz = -sum(abs2, z; dims = 1:(N - 1)) / T(2) .-
-                T(prod(S[1:(N - 1)]) / 2 * log(2π))
-    else
-        logpz = logpdf(n.basedist, z)
-    end
-    logpx = reshape(logpz, 1, S[N]) .- delta_logp
-    return (; logpx, delta_logp, z, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
+    return (; delta_logp, z, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
 end
-
-# function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N}
-#     S = size(x)
-#     (; regularize, monte_carlo) = st
-#     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
-
-#     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
-
-#     ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
-
-#     _z = ChainRulesCore.@ignore_derivatives fill!(
-#         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
-
-#     prob = ODEProblem{false}(ffjord, cat(x, _z; dims = Val(N - 1)), n.tspan, ps)
-#     sol = solve(prob, n.args...; sensealg, n.kwargs...,
-#         save_everystep = false, save_start = false, save_end = true)
-#     pred = __get_pred(sol)
-#     L = size(pred, N - 1)
-
-#     z = selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
-
-#     i₁ = L - ifelse(regularize, 2, 0)
-#     delta_logp = selectdim(pred, N - 1, i₁:i₁)
-#     if regularize
-#         λ₁ = selectdim(pred, N, (L - 1):(L - 1))
-#         λ₂ = selectdim(pred, N, L:L)
-#     else # For Type Stability
-#         λ₁ = λ₂ = delta_logp
-#     end
-
-#     if n.basedist === nothing
-#         logpz = -sum(abs2, z; dims = 1:(N - 1)) / T(2) .-
-#                 T(prod(S[1:(N - 1)]) / 2 * log(2π))
-#     else
-#         logpz = logpdf(n.basedist, z)
-#     end
-#     logpx = reshape(logpz, 1, S[N]) .- delta_logp
-#     return (logpx, λ₁, λ₂), (; model = model.st, regularize, monte_carlo)
-# end
 
 __get_pred(sol::ODESolution) = last(sol.u)
 __get_pred(sol::AbstractArray{T, N}) where {T, N} = selectdim(sol, N, size(sol, N))
 
-function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
-    px = n.basedist
+# function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
+#     px = n.basedist
 
-    if px === nothing
-        x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
-            randn(rng, T1, (n.input_dims..., n_samples))
-    else
-        x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
-    end
+#     if px === nothing
+#         x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
+#             randn(rng, T1, (n.input_dims..., n_samples))
+#     else
+#         x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
+#     end
 
-    return __backward_ffjord(n, x, ps, st)
-end
+#     return __backward_ffjord(n, x, ps, st)
+# end
 
 function __backward_ffjord(n::FFJORD, x, ps, st)
     N, S, T = ndims(x), size(x), eltype(x)
@@ -244,35 +197,6 @@ function __backward_ffjord(n::FFJORD, x, ps, st)
     return selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
 end
 
-# function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
-#     px = n.basedist
-
-#     if px === nothing
-#         x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
-#             randn(rng, T1, (n.input_dims..., n_samples))
-#     else
-#         x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
-#     end
-
-#     N, S, T = ndims(x), size(x), eltype(x)
-#     (; regularize, monte_carlo) = st
-#     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
-
-#     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
-
-#     ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
-
-#     _z = ChainRulesCore.@ignore_derivatives fill!(
-#         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
-#     prob = ODEProblem{false}(ffjord, cat(x, _z; dims = Val(N - 1)), reverse(n.tspan), ps)
-#     sol = solve(prob, n.args...; sensealg, n.kwargs...,
-#         save_everystep = false, save_start = false, save_end = true)
-#     pred = __get_pred(sol)
-#     L = size(pred, N - 1)
-
-#     return selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
-# end
-
 """
 FFJORD can be used as a distribution to generate new samples by `rand` or estimate densities
 by `pdf` or `logpdf` (from `Distributions.jl`).
@@ -283,8 +207,9 @@ Arguments:
   - `regularize`: Whether we use regularization (default: `false`).
   - `monte_carlo`: Whether we use monte carlo (default: `true`).
 """
-@concrete struct FFJORDDistribution{F <: FFJORD} <: ContinuousMultivariateDistribution
+@concrete struct FFJORDDistribution{F <: FFJORD, D <: Distribution} <: ContinuousMultivariateDistribution
     model::F
+    basedist::D
     ps
     st
 end
@@ -302,12 +227,23 @@ function __eltype(x)
     return T[]
 end
 
-function Distributions._logpdf(d::FFJORDDistribution, x::AbstractVector)
-    return first(first(__forward_ffjord(d.model, reshape(x, :, 1), d.ps, d.st)))
-end
 function Distributions._logpdf(d::FFJORDDistribution, x::AbstractArray)
-    return first(first(__forward_ffjord(d.model, x, d.ps, d.st)))
+    N, S, T = ndims(x), size(x), eltype(x)
+    # N, S, T = ndims(x), size(x), eltype(x)
+    delta_logps, z, _, _ = __forward_ffjord(d.model, reshape(x, :, 1), d.ps, d.st)
+    logpz = logpdf(d.basedist, z)
+    
+    logpx = reshape(logpz, 1, S[N]) .- delta_logps 
+    return return logpx
 end
+
+function Distributions._logpdf(d::FFJORDDistribution, x::AbstractVector)
+    (delta_logp, z, _, _), _ = __forward_ffjord(d.model, x, d.ps, d.st)
+    logpz = logpdf(d.basedist, z)
+    logpx = first(logpz) - delta_logp
+    return logpx
+end
+
 function Distributions._rand!(
         rng::AbstractRNG, d::FFJORDDistribution, x::AbstractArray{<:Real})
     copyto!(x, __backward_ffjord(eltype(d), d.model, size(x, ndims(x)), d.ps, d.st, rng))
