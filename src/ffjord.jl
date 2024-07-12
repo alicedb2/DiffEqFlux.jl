@@ -160,8 +160,7 @@ function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N
     end
 
     if n.basedist === nothing
-        logpz = -sum(abs2, z; dims = 1:(N - 1)) / T(2) .-
-                T(prod(S[1:(N - 1)]) / 2 * log(2π))
+        logpz = zeros(T, S[N])
     else
         logpz = logpdf(n.basedist, z)
     end
@@ -308,8 +307,9 @@ end
 function Distributions._logpdf(d::FFJORDDistribution, x::AbstractArray)
     return first(first(__forward_ffjord(d.model, x, d.ps, d.st)))
 end
+
 function Distributions._rand!(
-        rng::AbstractRNG, d::FFJORDDistribution, x::AbstractArray{<:Real})
-    copyto!(x, __backward_ffjord(eltype(d), d.model, size(x, ndims(x)), d.ps, d.st, rng))
+    rng::AbstractRNG, d::FFJORDDistribution, x::AbstractVector{<:Real})
+    copyto!(x, reshape(__backward_ffjord(eltype(d), d.model, 1, d.ps, d.st, rng), :))
     return x
 end
