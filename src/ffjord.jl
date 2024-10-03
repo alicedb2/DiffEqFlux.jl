@@ -78,7 +78,7 @@ end
 @inline __norm_batched(x) = sqrt.(sum(abs2, x; dims = 1:(ndims(x) - 1)))
 
 function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = nothing,
-        regularize::Bool = false, monte_carlo::Bool = false, mcdist=:rademacher) where {T, N}
+        regularize::Bool = false, monte_carlo::Bool = false, rng::AbstractRNG=default_rng(), mcdist::Symbol=:rademacher) where {T, N}
     L = size(u, N - 1)
     z = selectdim(u, N - 1, 1:(L - ifelse(regularize, 3, 1)))
     model = @set(_model.ps=p)
@@ -86,7 +86,7 @@ function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = noth
     @assert size(mz) == size(z)
     if monte_carlo
         ad = ad === nothing ? AutoZygote() : ad
-        e = CRC.@ignore_derivatives randn!(similar(mz))
+        e = CRC.@ignore_derivatives randn!(rng, similar(mz))
         if ad isa AutoForwardDiff
             @assert !regularize "If `regularize = true`, then use `AutoZygote` instead."
             Je = Lux.jacobian_vector_product(model, AutoForwardDiff(), z, e)
@@ -110,9 +110,9 @@ function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = noth
             J = Lux.batched_jacobian(model, ad, z)
             trace_jac = reshape(__trace_batched(J), ntuple(i -> 1, N - 1)..., :)
             if mcdist === :rademacher
-                e = CRC.@ignore_derivatives rand!(similar(mz), [one(T), -one(T)])
+                e = CRC.@ignore_derivatives rand!(rng, similar(mz), [one(T), -one(T)])
             elseif mcdist === :normal
-                e = CRC.@ignore_derivatives randn!(similar(mz))
+                e = CRC.@ignore_derivatives randn!(rng, similar(mz))
             else
                 error("`mcdist` must be `:rademacher` or `:normal`.")
             end
@@ -129,16 +129,17 @@ function __ffjord(_model::StatefulLuxLayer, u::AbstractArray{T, N}, p, ad = noth
     end
 end
 
-(n::FFJORD)(x, ps, st) = __forward_ffjord(n, x, ps, st)
+# (n::FFJORD)(x, ps, st) = __forward_ffjord(n, x, ps, st)
+(n::FFJORD)(x, ps, st, rng) = __forward_ffjord(n, x, ps, st, rng)
 
-function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st) where {T, N}
+function __forward_ffjord(n::FFJORD, x::AbstractArray{T, N}, ps, st, rng::AbstractRNG) where {T, N}
     S = size(x)
     (; regularize, monte_carlo) = st
     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
 
     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
 
-    ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
+    ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo, rng)
 
     _z = ChainRulesCore.@ignore_derivatives fill!(
         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
@@ -210,27 +211,29 @@ end
 __get_pred(sol::ODESolution) = last(sol.u)
 __get_pred(sol::AbstractArray{T, N}) where {T, N} = selectdim(sol, N, size(sol, N))
 
-function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
+function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng::AbstractRNG=default_rng()) where {T1}
     px = n.basedist
 
     if px === nothing
-        x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
-            randn(rng, T1, (n.input_dims..., n_samples))
+        # x = rng === nothing ? randn(T1, (n.input_dims..., n_samples)) :
+        #     randn(rng, T1, (n.input_dims..., n_samples))
+        randn(rng, T1, (n.input_dims..., n_samples))
     else
-        x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
+        # x = rng === nothing ? rand(px, n_samples) : rand(rng, px, n_samples)
+        rand(rng, px, n_samples)
     end
 
-    return __backward_ffjord(n, x, ps, st)
+    return __backward_ffjord(n, x, ps, st, rng)
 end
 
-function __backward_ffjord(n::FFJORD, x, ps, st)
+function __backward_ffjord(n::FFJORD, x, ps, st, rng::AbstractRNG=default_rng())
     N, S, T = ndims(x), size(x), eltype(x)
     (; regularize, monte_carlo) = st
     sensealg = InterpolatingAdjoint(; autojacvec = ZygoteVJP())
 
     model = StatefulLuxLayer{true}(n.model, nothing, st.model)
 
-    ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo)
+    ffjord(u, p, t) = __ffjord(model, u, p, n.ad, regularize, monte_carlo, rng)
 
     _z = ChainRulesCore.@ignore_derivatives fill!(
         similar(x, S[1:(N - 2)]..., ifelse(regularize, 3, 1), S[N]), zero(T))
@@ -240,7 +243,9 @@ function __backward_ffjord(n::FFJORD, x, ps, st)
     pred = __get_pred(sol)
     L = size(pred, N - 1)
 
-    return selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
+    ret = selectdim(pred, N - 1, 1:(L - ifelse(regularize, 3, 1)))
+
+    return ret
 end
 
 # function __backward_ffjord(::Type{T1}, n::FFJORD, n_samples::Int, ps, st, rng) where {T1}
@@ -301,11 +306,11 @@ function __eltype(x)
     return T[]
 end
 
-function Distributions._logpdf(d::FFJORDDistribution, x::AbstractVector)
-    return first(first(__forward_ffjord(d.model, reshape(x, :, 1), d.ps, d.st)))
+function Distributions._logpdf(d::FFJORDDistribution, x::AbstractVector, rng::AbstractRNG=default_rng())
+    return first(first(__forward_ffjord(d.model, reshape(x, :, 1), d.ps, d.st, rng)))
 end
-function Distributions._logpdf(d::FFJORDDistribution, x::AbstractArray)
-    return first(first(__forward_ffjord(d.model, x, d.ps, d.st)))
+function Distributions._logpdf(d::FFJORDDistribution, x::AbstractArray, rng::AbstractRNG=default_rng())
+    return first(first(__forward_ffjord(d.model, x, d.ps, d.s, rng)))
 end
 
 function Distributions._rand!(
